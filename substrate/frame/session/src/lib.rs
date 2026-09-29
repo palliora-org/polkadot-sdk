@@ -900,6 +900,11 @@ impl<T: Config> GuardianRegistration<T::ValidatorId> for Pallet<T> {
 	fn is_registered(id: &T::ValidatorId) -> bool {
 		Self::load_keys(id).is_some()
 	}
+
+	fn guard_key(id: &T::ValidatorId) -> Option<pallet_guard_session::GuardianId> {
+		Self::load_keys(id)
+			.and_then(|keys| keys.get(<pallet_guard_session::GuardianId as RuntimeAppPublic>::ID))
+	}
 }
 
 impl<T: Config> ValidatorSet<T::AccountId> for Pallet<T> {

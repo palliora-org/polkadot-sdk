@@ -23,6 +23,9 @@ pub use pallet::*;
 
 pub const LOG_TARGET: &str = "runtime::guard-session";
 
+/// Domain separator for agreement response signatures.
+pub const AGREEMENT_RESPONSE_CONTEXT: &[u8] = b"palliora/guard-agreement-response/v1";
+
 mod app {
 	use scale_info::prelude::string::String;
 	use sp_application_crypto::{app_crypto, key_types::GUARDIAN, sr25519};
@@ -78,6 +81,10 @@ enum OffchainErr {
 	FailedSigning,
 	FailedToAcquireLock,
 	SubmitTransaction,
+	/// The account has no guardian id, so no registered key can be looked up for it.
+	UnknownGuardian,
+	/// No `GUARDIAN` session key is registered on chain, or its secret is not in the keystore.
+	MissingGuardKey,
 }
 
 type OffchainResult<A> = Result<A, OffchainErr>;
@@ -151,6 +158,13 @@ pub trait GuardianRegistration<GuardianId> {
 	/// Returns true if the provided guardian ID has been registered with the implementing runtime
 	/// module
 	fn is_registered(id: &GuardianId) -> bool;
+
+	/// The `GUARDIAN` session key registered for `id`, if any.
+	///
+	/// This is the public half of the key a guardian signs agreement responses with, and the
+	/// only on-chain binding from a guardian account to signable material. `WorkerByKey` holds
+	/// the node's libp2p network key instead, whose secret never reaches the keystore.
+	fn guard_key(id: &GuardianId) -> Option<crate::GuardianId>;
 }
 
 /// Handler for session life cycle events.
@@ -436,7 +450,9 @@ use super::*;
 		fn offchain_worker(now: BlockNumberFor<T>) {
 			// Only send messages if we are a potential validator.
 			if sp_io::offchain::is_guardian() {
-				Self::accept_agreements();
+				if let Err(e) = Self::accept_agreements() {
+					log::warn!(target: LOG_TARGET, "Failed to respond to agreements: {e:?}");
+				}
 			} else {
 				log::trace!(
 					target: LOG_TARGET,
@@ -510,7 +526,19 @@ use super::*;
 		type Call = Call<T>;
 
 		fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
-			if let Call::agreement_response { agreementid, address, signature, .. } = call {
+			if let Call::agreement_response { agreementid, address, signature, acceptance } = call {
+				// `address` is the guardian's own id, as `rotate_guard_session` also assumes
+				// when it hands ids straight to `is_registered`. Converting through
+				// `ValidatorIdOf` would instead demand a staking ledger keyed by controller.
+				let guardian_id = T::GuardianId::try_from(address.clone())
+					.map_err(|_| InvalidTransaction::BadSigner)?;
+				let guard_key = T::GuardianRegistration::guard_key(&guardian_id)
+					.ok_or(InvalidTransaction::BadSigner)?;
+
+				let payload = Self::agreement_payload(agreementid, address, *acceptance);
+				if !guard_key.verify(&payload, signature) {
+					return InvalidTransaction::BadProof.into();
+				}
 
 				ValidTransaction::with_tag_prefix("GuardAgreement")
 					.priority(TransactionPriority::MAX)
@@ -625,55 +653,53 @@ impl<T: Config> Pallet<T> {
 		DefafaultGroupsMarker::<T>::put(value);
 	}
 
-	fn sign_and_send(agreements: Vec<([u8; 32], T::AccountId, bool)>) -> OffchainResult<()> {
-		// local keystore
-		//
-		// All `GuardianId` public (+private) keys currently in the local keystore.
-		let mut local_keys = GuardianId::all();
-		local_keys.sort();
+	/// The bytes a guardian signs to endorse an agreement response.
+	///
+	/// The address and the acceptance bit are bound alongside the agreement so a signature
+	/// cannot be re-aimed at another guardian or flipped from accept to reject; the genesis
+	/// hash and the context string keep it off other chains and other calls.
+	pub fn agreement_payload(
+		agreementid: &[u8; 32],
+		address: &T::AccountId,
+		acceptance: bool,
+	) -> Vec<u8> {
+		let genesis = frame_system::Pallet::<T>::block_hash(
+			frame_system::pallet_prelude::BlockNumberFor::<T>::zero(),
+		);
+		(AGREEMENT_RESPONSE_CONTEXT, genesis, agreementid, address, acceptance).encode()
+	}
 
-		// on-chain storage
-		//
-		// At index `idx`:
-		// 1. A (GuardianId) public key to be used by a validator at index `idx` to send im-online
-		//    heartbeats.
-		let guardians = Keys::<T>::get();
-		log::info!(target: LOG_TARGET, "Keys in session = {guardians:?}");
+	fn sign_and_send(address: T::AccountId, agreements: Vec<([u8; 32], bool)>) -> OffchainResult<()> {
+		let guardian_id =
+			T::GuardianId::try_from(address.clone()).map_err(|_| OffchainErr::UnknownGuardian)?;
+		let registered =
+			T::GuardianRegistration::guard_key(&guardian_id).ok_or(OffchainErr::MissingGuardKey)?;
 
-		// TODO: remove signing using local_keys
-		local_keys.iter().for_each(|key| {
-			log::trace!(target: LOG_TARGET, "Signing agreement unconditionally");
-			for (agreementid, address, acceptance) in agreements.clone() {
-				let signature = key.sign(&agreementid.encode()).ok_or(OffchainErr::FailedSigning);
-				let signature = signature.unwrap();
-	
-				let call = Call::agreement_response { agreementid, address: address.clone(), signature, acceptance };
-	
-				SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into()).unwrap_or_else(|e| {
-						log::error!(target: LOG_TARGET, "Failed to submit agreement transaction. Error = {e:?}");
-					});
-			}
-		});
+		// Sign with the key the chain has registered for this account rather than with whatever
+		// `GUARDIAN` keys happen to be in the keystore: only this one verifies on the far side.
+		let key = GuardianId::all()
+			.into_iter()
+			.find(|local| local == &registered)
+			.ok_or(OffchainErr::MissingGuardKey)?;
 
-		guardians.into_iter().enumerate().filter_map(move |(index, guardian)| {
-			log::info!(target: LOG_TARGET, "guardian id = {guardian:?}");
-			local_keys
-				.binary_search(&guardian)
-				.ok()
-				.map(|location| (index as u32, local_keys[location].clone()))
-		}).map(move |(_, key)| {
-			log::trace!(target: LOG_TARGET, "Signing agreement with as guardian");
-			for (agreementid, address, acceptance) in agreements.clone() {
-				let signature = key.sign(&agreementid.encode()).ok_or(OffchainErr::FailedSigning);
-				let signature = signature.unwrap();
-	
-				let call = Call::agreement_response { agreementid, address: address.clone(), signature, acceptance };
-	
-				SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into()).unwrap_or_else(|e| {
-						log::error!(target: LOG_TARGET, "Failed to submit agreement transaction. Error = {e:?}");
-					});
-			}
-		});
+		log::info!(target: LOG_TARGET, "Signing agreements as guardian {registered:?}");
+
+		for (agreementid, acceptance) in agreements {
+			let payload = Self::agreement_payload(&agreementid, &address, acceptance);
+			let signature = key.sign(&payload).ok_or(OffchainErr::FailedSigning)?;
+
+			let call = Call::agreement_response {
+				agreementid,
+				address: address.clone(),
+				signature,
+				acceptance,
+			};
+
+			SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into())
+				.unwrap_or_else(|e| {
+					log::error!(target: LOG_TARGET, "Failed to submit agreement transaction. Error = {e:?}");
+				});
+		}
 
 		Ok(())
 	}
@@ -727,14 +753,13 @@ impl<T: Config> Pallet<T> {
 			}
 
 			log::trace!(target: LOG_TARGET, "Accepting agreement {:?}", et.2);
-			agreements.push((et.2, my_address.clone(), AgreementAction::Accept == et.0));
+			agreements.push((et.2, AgreementAction::Accept == et.0));
 
 			sp_io::offchain::local_storage_set(StorageKind::PERSISTENT, item_hash.as_ref(), Encode::encode(&(et.0, AgreementState::Processed, et.2)).as_slice());
 		}
 
 		log::info!(target: LOG_TARGET, "agreements = {agreements:?}");
-		Self::sign_and_send(agreements);
-		Ok(())
+		Self::sign_and_send(my_address, agreements)
 	}
 
 	fn initialize_keys(keys: &[GuardianId]) {
