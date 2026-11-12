@@ -195,7 +195,11 @@ where
 }
 
 /// Store last pruned tags for given number of invocations.
-const RECENTLY_PRUNED_TAGS: usize = 2;
+///
+/// A transaction that requires a tag of a just-included one can reach a node several blocks
+/// later: transactions are re-broadcast only every 2.9 s, and revalidation checks requirements
+/// again. 16 invocations cover 8 s of 500 ms blocks.
+const RECENTLY_PRUNED_TAGS: usize = 16;
 
 /// Transaction pool.
 ///
@@ -212,7 +216,7 @@ pub struct BasePool<Hash: hash::Hash + Eq, Ex> {
 	reject_future_transactions: bool,
 	future: FutureTransactions<Hash, Ex>,
 	ready: ReadyTransactions<Hash, Ex>,
-	/// Store recently pruned tags (for last two invocations).
+	/// Store recently pruned tags (for the last `RECENTLY_PRUNED_TAGS` invocations).
 	///
 	/// This is used to make sure we don't accidentally put
 	/// transactions to future in case they were just stuck in verification.
