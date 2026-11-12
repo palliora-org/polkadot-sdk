@@ -183,6 +183,29 @@ impl<B: ChainApi> ValidatedPool<B> {
 			.collect()
 	}
 
+	/// Tells the import notification sinks that `hashes` just became ready, which is what makes
+	/// the network propagate them straight away rather than on its next periodic round. A
+	/// transaction promoted out of the future queue needs this as much as a new import does.
+	fn notify_ready(&self, hashes: impl IntoIterator<Item = ExtrinsicHash<B>>) {
+		let sinks = &mut self.import_notification_sinks.lock();
+		for hash in hashes {
+			sinks.retain_mut(|sink| match sink.try_send(hash) {
+				Ok(()) => true,
+				Err(e) =>
+					if e.is_full() {
+						log::warn!(
+							target: LOG_TARGET,
+							"[{:?}] Trying to notify an import but the channel is full",
+							hash,
+						);
+						true
+					} else {
+						false
+					},
+			});
+		}
+	}
+
 	/// Submit single pre-validated transaction to the pool.
 	fn submit_one(&self, tx: ValidatedTransactionFor<B>) -> Result<ExtrinsicHash<B>, B::Error> {
 		match tx {
@@ -193,22 +216,8 @@ impl<B: ChainApi> ValidatedPool<B> {
 
 				let imported = self.pool.write().import(tx)?;
 
-				if let base::Imported::Ready { ref hash, .. } = imported {
-					let sinks = &mut self.import_notification_sinks.lock();
-					sinks.retain_mut(|sink| match sink.try_send(*hash) {
-						Ok(()) => true,
-						Err(e) =>
-							if e.is_full() {
-								log::warn!(
-									target: LOG_TARGET,
-									"[{:?}] Trying to notify an import but the channel is full",
-									hash,
-								);
-								true
-							} else {
-								false
-							},
-					});
+				if let base::Imported::Ready { ref hash, ref promoted, .. } = imported {
+					self.notify_ready(std::iter::once(*hash).chain(promoted.iter().copied()));
 				}
 
 				let mut listener = self.listener.write();
@@ -454,6 +463,13 @@ impl<B: ChainApi> ValidatedPool<B> {
 	) -> Result<PruneStatus<ExtrinsicHash<B>, ExtrinsicFor<B>>, B::Error> {
 		// Perform tag-based pruning in the base pool
 		let status = self.pool.write().prune_tags(tags);
+		self.notify_ready(status.promoted.iter().flat_map(|imported| {
+			let promoted = match imported {
+				base::Imported::Ready { promoted, .. } => promoted.as_slice(),
+				base::Imported::Future { .. } => &[],
+			};
+			std::iter::once(*imported.hash()).chain(promoted.iter().copied())
+		}));
 		// Notify event listeners of all transactions
 		// that were promoted to `Ready` or were dropped.
 		{
