@@ -965,3 +965,117 @@ fn request_across_forks() {
 		assert!(sync.is_known(&block.header.parent_hash()));
 	}
 }
+
+/// Set up a sync over an empty client, with one available peer whose best block is the last
+/// of four blocks built on another client.
+fn sync_with_peer_ahead() -> (ChainSync<Block, TestClient>, Vec<Block>, PeerId) {
+	let mut client2 = Arc::new(TestClientBuilder::new().build());
+	let blocks = (0..4).map(|_| build_block(&mut client2, None, false)).collect::<Vec<_>>();
+	let empty_client = Arc::new(TestClientBuilder::new().build());
+	let mut sync = ChainSync::new(ChainSyncMode::Full, empty_client, 1, 64, None).unwrap();
+
+	let peer_id = PeerId::random();
+	let best = blocks[3].clone();
+	sync.add_peer(peer_id, best.hash(), *best.header().number());
+	sync.peers.get_mut(&peer_id).unwrap().state = PeerSyncState::Available;
+	sync.peers.get_mut(&peer_id).unwrap().common_number = 0;
+	(sync, blocks, peer_id)
+}
+
+#[test]
+fn empty_block_response_keeps_peer_and_moves_range_to_another_peer() {
+	sp_tracing::try_init_simple();
+	let (mut sync, blocks, peer_id1) = sync_with_peer_ahead();
+	let best = blocks[3].clone();
+
+	let request = get_block_request(&mut sync, FromBlock::Hash(best.hash()), 4, &peer_id1);
+	let empty_response = BlockResponse::<Block> { id: 0, blocks: Vec::new() };
+
+	// Not having the blocks is not misbehaviour: no penalty and no disconnect.
+	assert_eq!(sync.on_block_data(&peer_id1, Some(request.clone()), empty_response), Ok(()));
+	assert!(sync.peers[&peer_id1].state.is_available());
+	assert!(sync.take_actions().all(|action| !matches!(action, ChainSyncAction::DropPeer(_))));
+
+	// The peer is not asked for the same range again...
+	assert!(sync.block_requests().is_empty());
+
+	// ...but another peer is.
+	let peer_id2 = PeerId::random();
+	sync.add_peer(peer_id2, best.hash(), *best.header().number());
+	sync.peers.get_mut(&peer_id2).unwrap().state = PeerSyncState::Available;
+	sync.peers.get_mut(&peer_id2).unwrap().common_number = 0;
+	assert_eq!(request, get_block_request(&mut sync, FromBlock::Hash(best.hash()), 4, &peer_id2));
+}
+
+#[test]
+fn missing_blocks_marker_expires() {
+	sp_tracing::try_init_simple();
+	let (mut sync, blocks, peer_id) = sync_with_peer_ahead();
+	let best = blocks[3].clone();
+
+	let request = get_block_request(&mut sync, FromBlock::Hash(best.hash()), 4, &peer_id);
+	let empty_response = BlockResponse::<Block> { id: 0, blocks: Vec::new() };
+	assert_eq!(sync.on_block_data(&peer_id, Some(request.clone()), empty_response), Ok(()));
+	assert!(sync.block_requests().is_empty());
+
+	// Once the marker is older than the TTL the peer may have the blocks again.
+	let expired = Instant::now().checked_sub(MISSING_BLOCKS_TTL).unwrap();
+	sync.missing_blocks.get_mut(&peer_id).unwrap().1 = expired;
+	sync.allowed_requests.set_all();
+	assert_eq!(request, get_block_request(&mut sync, FromBlock::Hash(best.hash()), 4, &peer_id));
+}
+
+#[test]
+fn removing_peer_forgets_missing_blocks() {
+	sp_tracing::try_init_simple();
+	let (mut sync, blocks, peer_id) = sync_with_peer_ahead();
+	let best = blocks[3].clone();
+
+	let request = get_block_request(&mut sync, FromBlock::Hash(best.hash()), 4, &peer_id);
+	let empty_response = BlockResponse::<Block> { id: 0, blocks: Vec::new() };
+	assert_eq!(sync.on_block_data(&peer_id, Some(request), empty_response), Ok(()));
+	assert!(sync.missing_blocks.contains_key(&peer_id));
+
+	sync.remove_peer(&peer_id);
+	assert!(!sync.missing_blocks.contains_key(&peer_id));
+}
+
+#[test]
+fn non_empty_wrong_block_response_still_gets_the_harsh_penalty() {
+	sp_tracing::try_init_simple();
+	let (mut sync, blocks, peer_id) = sync_with_peer_ahead();
+	let best = blocks[3].clone();
+
+	// A non-empty response that does not start at the requested block is a protocol violation.
+	let request = get_block_request(&mut sync, FromBlock::Hash(best.hash()), 4, &peer_id);
+	let response = create_block_response(vec![blocks[1].clone()]);
+	assert_eq!(
+		sync.on_block_data(&peer_id, Some(request), response),
+		Err(BadPeer(peer_id, rep::NOT_REQUESTED)),
+	);
+}
+
+#[test]
+fn empty_gap_block_response_keeps_peer_and_moves_range_to_another_peer() {
+	sp_tracing::try_init_simple();
+	let mut client = Arc::new(TestClientBuilder::new().build());
+	let blocks = (0..10).map(|_| build_block(&mut client, None, false)).collect::<Vec<_>>();
+	client.finalize_block(blocks[9].hash(), None).unwrap();
+
+	let mut sync = ChainSync::new(ChainSyncMode::Full, client.clone(), 5, 2, None).unwrap();
+	sync.gap_sync =
+		Some(GapSync { blocks: BlockCollection::new(), best_queued_number: 6, target: 9 });
+
+	let peer_id1 = PeerId::random();
+	sync.add_peer(peer_id1, blocks[9].hash(), 10);
+	let request = get_block_request(&mut sync, FromBlock::Number(8), 2, &peer_id1);
+
+	let empty_response = BlockResponse::<Block> { id: 0, blocks: Vec::new() };
+	assert_eq!(sync.on_block_data(&peer_id1, Some(request.clone()), empty_response), Ok(()));
+	assert!(sync.peers[&peer_id1].state.is_available());
+	assert!(sync.block_requests().is_empty());
+
+	let peer_id2 = PeerId::random();
+	sync.add_peer(peer_id2, blocks[9].hash(), 10);
+	assert_eq!(request, get_block_request(&mut sync, FromBlock::Number(8), 2, &peer_id2));
+}

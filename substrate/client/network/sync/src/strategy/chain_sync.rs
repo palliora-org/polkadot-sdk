@@ -65,6 +65,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	ops::Range,
 	sync::Arc,
+	time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -82,6 +83,11 @@ const MAX_BLOCKS_TO_LOOK_BACKWARDS: u32 = MAX_DOWNLOAD_AHEAD / 2;
 
 /// Pick the state to sync as the latest finalized number minus this.
 const STATE_SYNC_FINALITY_THRESHOLD: u32 = 8;
+
+/// How long a peer that answered a block request with no blocks is not asked again for a range
+/// at or below the one it could not serve. Bounded because the peer's history moves: a pruning
+/// node loses old bodies over time, and a warp-synced node gains them as it backfills.
+const MISSING_BLOCKS_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// We use a heuristic that with a high likelihood, by the time
 /// `MAJOR_SYNC_BLOCKS` have been imported we'll be on the same
@@ -281,6 +287,9 @@ pub struct ChainSync<B: BlockT, Client> {
 	import_existing: bool,
 	/// Gap download process.
 	gap_sync: Option<GapSync<B>>,
+	/// Peers that answered a block request with no blocks: the highest block number they could
+	/// not serve, and when. Kept outside `peers` so that it survives `restart`.
+	missing_blocks: HashMap<PeerId, (NumberFor<B>, Instant)>,
 	/// Pending actions.
 	actions: Vec<ChainSyncAction<B>>,
 	/// Prometheus metrics.
@@ -392,6 +401,7 @@ where
 			state_sync: None,
 			import_existing: false,
 			gap_sync: None,
+			missing_blocks: HashMap::new(),
 			actions: Vec::new(),
 			metrics: metrics_registry.and_then(|r| match Metrics::register(&r) {
 				Ok(metrics) => Some(metrics),
@@ -696,6 +706,16 @@ where
 					PeerSyncState::DownloadingNew(_) => {
 						self.blocks.clear_peer_download(peer_id);
 						peer.state = PeerSyncState::Available;
+						if blocks.is_empty() {
+							let top = requested_top::<B>(&request, peer.best_number);
+							note_missing_blocks::<B>(&mut self.missing_blocks, *peer_id, top);
+							debug!(
+								target: LOG_TARGET,
+								"Peer {peer_id} has no blocks at or below #{top}; keeping it \
+								 connected and requesting that range from other peers",
+							);
+							return Ok(())
+						}
 						if let Some(start_block) =
 							validate_blocks::<B>(&blocks, peer_id, Some(request))?
 						{
@@ -718,6 +738,17 @@ where
 					},
 					PeerSyncState::DownloadingGap(_) => {
 						peer.state = PeerSyncState::Available;
+						if let (true, Some(gap_sync)) = (blocks.is_empty(), &mut self.gap_sync) {
+							gap_sync.blocks.clear_peer_download(peer_id);
+							let top = requested_top::<B>(&request, peer.best_number);
+							note_missing_blocks::<B>(&mut self.missing_blocks, *peer_id, top);
+							debug!(
+								target: LOG_TARGET,
+								"Peer {peer_id} has no gap blocks at or below #{top}; keeping it \
+								 connected and requesting that range from other peers",
+							);
+							return Ok(())
+						}
 						if let Some(gap_sync) = &mut self.gap_sync {
 							gap_sync.blocks.clear_peer_download(peer_id);
 							if let Some(start_block) =
@@ -1160,6 +1191,7 @@ where
 			gap_sync.blocks.clear_peer_download(peer_id)
 		}
 		self.peers.remove(peer_id);
+		self.missing_blocks.remove(peer_id);
 		self.extra_justifications.peer_disconnected(peer_id);
 		self.allowed_requests.set_all();
 		self.fork_targets.retain(|_, target| {
@@ -1558,6 +1590,7 @@ where
 		let max_parallel = if is_major_syncing { 1 } else { self.max_parallel_downloads };
 		let max_blocks_per_request = self.max_blocks_per_request;
 		let gap_sync = &mut self.gap_sync;
+		let missing_blocks = &self.missing_blocks;
 		self.peers
 			.iter_mut()
 			.filter_map(move |(&id, peer)| {
@@ -1599,7 +1632,14 @@ where
 					max_blocks_per_request,
 					last_finalized,
 					best_queued,
-				) {
+				)
+				.filter(|(range, _)| {
+					let missing = is_missing_blocks::<B>(missing_blocks, &id, range.end - One::one());
+					if missing {
+						blocks.clear_peer_download(&id);
+					}
+					!missing
+				}) {
 					peer.state = PeerSyncState::DownloadingNew(range.start);
 					trace!(
 						target: LOG_TARGET,
@@ -1638,6 +1678,14 @@ where
 						sync.best_queued_number,
 						max_blocks_per_request,
 					)
+					.filter(|(range, _)| {
+						let top = range.end - One::one();
+						let missing = is_missing_blocks::<B>(missing_blocks, &id, top);
+						if missing {
+							sync.blocks.clear_peer_download(&id);
+						}
+						!missing
+					})
 				}) {
 					peer.state = PeerSyncState::DownloadingGap(range.start);
 					trace!(
@@ -2086,6 +2134,47 @@ fn peer_gap_block_request<B: BlockT>(
 		max: Some((range.end - range.start).saturated_into::<u32>()),
 	};
 	Some((range, request))
+}
+
+/// The highest block a descending block request asks for.
+fn requested_top<B: BlockT>(request: &BlockRequest<B>, peer_best: NumberFor<B>) -> NumberFor<B> {
+	match request.from {
+		FromBlock::Number(number) => number,
+		FromBlock::Hash(_) => peer_best,
+	}
+}
+
+/// Remember that `peer_id` had no blocks at or below `number`.
+///
+/// An empty response is how a node answers for a range it does not hold (it serves blocks
+/// until the first one it lacks), so this is not misbehaviour: the peer stays connected and
+/// keeps serving every other protocol, it is just not asked for that range again for a while.
+fn note_missing_blocks<B: BlockT>(
+	missing_blocks: &mut HashMap<PeerId, (NumberFor<B>, Instant)>,
+	peer_id: PeerId,
+	number: NumberFor<B>,
+) {
+	let now = Instant::now();
+	missing_blocks
+		.entry(peer_id)
+		.and_modify(|(highest, at)| {
+			if *highest < number || now.duration_since(*at) >= MISSING_BLOCKS_TTL {
+				*highest = number;
+			}
+			*at = now;
+		})
+		.or_insert((number, now));
+}
+
+/// Whether `peer_id` recently had no blocks at or below `number`.
+fn is_missing_blocks<B: BlockT>(
+	missing_blocks: &HashMap<PeerId, (NumberFor<B>, Instant)>,
+	peer_id: &PeerId,
+	number: NumberFor<B>,
+) -> bool {
+	missing_blocks
+		.get(peer_id)
+		.map_or(false, |(highest, at)| number <= *highest && at.elapsed() < MISSING_BLOCKS_TTL)
 }
 
 /// Get pending fork sync targets for a peer.
