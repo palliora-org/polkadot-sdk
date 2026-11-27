@@ -288,7 +288,8 @@ pub struct ChainSync<B: BlockT, Client> {
 	/// Gap download process.
 	gap_sync: Option<GapSync<B>>,
 	/// Peers that answered a block request with no blocks: the highest block number they could
-	/// not serve, and when. Kept outside `peers` so that it survives `restart`.
+	/// not serve, and when. Kept outside `peers` so that it survives `restart` and reconnects;
+	/// entries expire after `MISSING_BLOCKS_TTL`.
 	missing_blocks: HashMap<PeerId, (NumberFor<B>, Instant)>,
 	/// Pending actions.
 	actions: Vec<ChainSyncAction<B>>,
@@ -1191,7 +1192,6 @@ where
 			gap_sync.blocks.clear_peer_download(peer_id)
 		}
 		self.peers.remove(peer_id);
-		self.missing_blocks.remove(peer_id);
 		self.extra_justifications.peer_disconnected(peer_id);
 		self.allowed_requests.set_all();
 		self.fork_targets.retain(|_, target| {
@@ -2155,12 +2155,11 @@ fn note_missing_blocks<B: BlockT>(
 	number: NumberFor<B>,
 ) {
 	let now = Instant::now();
+	missing_blocks.retain(|_, (_, at)| now.duration_since(*at) < MISSING_BLOCKS_TTL);
 	missing_blocks
 		.entry(peer_id)
 		.and_modify(|(highest, at)| {
-			if *highest < number || now.duration_since(*at) >= MISSING_BLOCKS_TTL {
-				*highest = number;
-			}
+			*highest = (*highest).max(number);
 			*at = now;
 		})
 		.or_insert((number, now));

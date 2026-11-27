@@ -1026,7 +1026,7 @@ fn missing_blocks_marker_expires() {
 }
 
 #[test]
-fn removing_peer_forgets_missing_blocks() {
+fn missing_blocks_marker_survives_reconnect() {
 	sp_tracing::try_init_simple();
 	let (mut sync, blocks, peer_id) = sync_with_peer_ahead();
 	let best = blocks[3].clone();
@@ -1034,10 +1034,26 @@ fn removing_peer_forgets_missing_blocks() {
 	let request = get_block_request(&mut sync, FromBlock::Hash(best.hash()), 4, &peer_id);
 	let empty_response = BlockResponse::<Block> { id: 0, blocks: Vec::new() };
 	assert_eq!(sync.on_block_data(&peer_id, Some(request), empty_response), Ok(()));
-	assert!(sync.missing_blocks.contains_key(&peer_id));
 
+	// A peer that drops and reconnects is not asked for the same range again.
 	sync.remove_peer(&peer_id);
-	assert!(!sync.missing_blocks.contains_key(&peer_id));
+	sync.add_peer(peer_id, best.hash(), *best.header().number());
+	sync.peers.get_mut(&peer_id).unwrap().state = PeerSyncState::Available;
+	sync.peers.get_mut(&peer_id).unwrap().common_number = 0;
+	assert!(sync.block_requests().is_empty());
+}
+
+#[test]
+fn expired_missing_blocks_markers_are_pruned() {
+	sp_tracing::try_init_simple();
+	let mut missing = HashMap::new();
+	let (stale, fresh) = (PeerId::random(), PeerId::random());
+	missing.insert(stale, (10u64, Instant::now().checked_sub(MISSING_BLOCKS_TTL).unwrap()));
+
+	note_missing_blocks::<Block>(&mut missing, fresh, 5);
+
+	assert!(!missing.contains_key(&stale));
+	assert_eq!(missing[&fresh].0, 5);
 }
 
 #[test]
